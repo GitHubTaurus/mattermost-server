@@ -51,7 +51,7 @@ type Hub struct {
 	// See https://github.com/mattermost/mattermost-server/pull/7281
 	connectionCount int64
 	srv             *Server
-	connectionIndex int
+	index           int
 	register        chan *WebConn
 	unregister      chan *WebConn
 	broadcast       chan *model.WebSocketEvent
@@ -63,6 +63,7 @@ type Hub struct {
 	explicitStop    bool
 	checkRegistered chan *webConnSessionMessage
 	checkConn       chan *webConnCheckMessage
+	connectionIndex *hubConnectionIndex
 }
 
 // newWebHub creates a new Hub.
@@ -96,7 +97,7 @@ func (s *Server) HubStart() {
 
 	for i := 0; i < numberOfHubs; i++ {
 		hubs[i] = newWebHub(s)
-		hubs[i].connectionIndex = i
+		hubs[i].index = i
 		hubs[i].Start()
 	}
 	// Assigning to the hubs slice without any mutex is fine because it is only assigned once
@@ -139,7 +140,7 @@ func (a *App) HubRegister(webConn *WebConn) {
 	hub := a.GetHubForUserId(webConn.UserId)
 	if hub != nil {
 		if metrics := a.Metrics(); metrics != nil {
-			metrics.IncrementWebSocketBroadcastUsersRegistered(strconv.Itoa(hub.connectionIndex), 1)
+			metrics.IncrementWebSocketBroadcastUsersRegistered(strconv.Itoa(hub.index), 1)
 		}
 		hub.Register(webConn)
 	}
@@ -150,7 +151,7 @@ func (a *App) HubUnregister(webConn *WebConn) {
 	hub := a.GetHubForUserId(webConn.UserId)
 	if hub != nil {
 		if metrics := a.Metrics(); metrics != nil {
-			metrics.DecrementWebSocketBroadcastUsersRegistered(strconv.Itoa(hub.connectionIndex), 1)
+			metrics.DecrementWebSocketBroadcastUsersRegistered(strconv.Itoa(hub.index), 1)
 		}
 		hub.Unregister(webConn)
 	}
@@ -354,7 +355,7 @@ func (h *Hub) Broadcast(message *model.WebSocketEvent) {
 	// NewServer itself.
 	if h != nil && message != nil {
 		if metrics := h.srv.Metrics; metrics != nil {
-			metrics.IncrementWebSocketBroadcastBufferSize(strconv.Itoa(h.connectionIndex), 1)
+			metrics.IncrementWebSocketBroadcastBufferSize(strconv.Itoa(h.index), 1)
 		}
 		select {
 		case h.broadcast <- message:
@@ -408,19 +409,19 @@ func (h *Hub) Start() {
 	var doRecover func()
 
 	doStart = func() {
-		mlog.Debug("Hub is starting", mlog.Int("index", h.connectionIndex))
+		mlog.Debug("Hub is starting", mlog.Int("index", h.index))
 
 		ticker := time.NewTicker(inactiveConnReaperInterval)
 		defer ticker.Stop()
 
 		appInstance := New(ServerConnector(h.srv.Channels()))
 
-		connIndex := newHubConnectionIndex(inactiveConnReaperInterval)
+		h.connectionIndex = newHubConnectionIndex(inactiveConnReaperInterval)
 
 		for {
 			select {
 			case webSessionMessage := <-h.checkRegistered:
-				conns := connIndex.ForUser(webSessionMessage.userID)
+				conns := h.connectionIndex.ForUser(webSessionMessage.userID)
 				var isRegistered bool
 				for _, conn := range conns {
 					if !conn.active {
@@ -433,7 +434,7 @@ func (h *Hub) Start() {
 				webSessionMessage.isRegistered <- isRegistered
 			case req := <-h.checkConn:
 				var res *CheckConnResult
-				conn := connIndex.RemoveInactiveByConnectionID(req.userID, req.connectionID)
+				conn := h.connectionIndex.RemoveInactiveByConnectionID(req.userID, req.connectionID)
 				if conn != nil {
 					res = &CheckConnResult{
 						ConnectionID:     req.connectionID,
@@ -446,15 +447,15 @@ func (h *Hub) Start() {
 				}
 				req.result <- res
 			case <-ticker.C:
-				connIndex.RemoveInactiveConnections()
+				h.connectionIndex.RemoveInactiveConnections()
 			case webConn := <-h.register:
 				// Mark the current one as active.
 				// There is no need to check if it was inactive or not,
 				// we will anyways need to make it active.
 				webConn.active = true
 
-				connIndex.Add(webConn)
-				atomic.StoreInt64(&h.connectionCount, int64(connIndex.AllActive()))
+				h.connectionIndex.Add(webConn)
+				atomic.StoreInt64(&h.connectionCount, int64(h.connectionIndex.AllActive()))
 
 				if webConn.IsAuthenticated() && webConn.reuseCount == 0 {
 					// The hello message should only be sent when the reuseCount is 0.
@@ -468,13 +469,13 @@ func (h *Hub) Start() {
 				// But if not removed, mark inactive.
 				webConn.active = false
 
-				atomic.StoreInt64(&h.connectionCount, int64(connIndex.AllActive()))
+				atomic.StoreInt64(&h.connectionCount, int64(h.connectionIndex.AllActive()))
 
 				if webConn.UserId == "" {
 					continue
 				}
 
-				conns := connIndex.ForUser(webConn.UserId)
+				conns := h.connectionIndex.ForUser(webConn.UserId)
 				if len(conns) == 0 || areAllInactive(conns) {
 					h.srv.Go(func() {
 						appInstance.SetStatusOffline(webConn.UserId, false)
@@ -497,11 +498,11 @@ func (h *Hub) Start() {
 					})
 				}
 			case userID := <-h.invalidateUser:
-				for _, webConn := range connIndex.ForUser(userID) {
+				for _, webConn := range h.connectionIndex.ForUser(userID) {
 					webConn.InvalidateCache()
 				}
 			case activity := <-h.activity:
-				for _, webConn := range connIndex.ForUser(activity.userID) {
+				for _, webConn := range h.connectionIndex.ForUser(activity.userID) {
 					if !webConn.active {
 						continue
 					}
@@ -510,7 +511,7 @@ func (h *Hub) Start() {
 					}
 				}
 			case directMsg := <-h.directMsg:
-				if !connIndex.Has(directMsg.conn) {
+				if !h.connectionIndex.Has(directMsg.conn) {
 					continue
 				}
 				select {
@@ -518,15 +519,15 @@ func (h *Hub) Start() {
 				default:
 					mlog.Error("webhub.broadcast: cannot send, closing websocket for user", mlog.String("user_id", directMsg.conn.UserId))
 					close(directMsg.conn.send)
-					connIndex.Remove(directMsg.conn)
+					h.connectionIndex.Remove(directMsg.conn)
 				}
 			case msg := <-h.broadcast:
 				if metrics := h.srv.Metrics; metrics != nil {
-					metrics.DecrementWebSocketBroadcastBufferSize(strconv.Itoa(h.connectionIndex), 1)
+					metrics.DecrementWebSocketBroadcastBufferSize(strconv.Itoa(h.index), 1)
 				}
 				msg = msg.PrecomputeJSON()
 				broadcast := func(webConn *WebConn) {
-					if !connIndex.Has(webConn) {
+					if !h.connectionIndex.Has(webConn) {
 						return
 					}
 					if webConn.shouldSendEvent(msg) {
@@ -535,23 +536,23 @@ func (h *Hub) Start() {
 						default:
 							mlog.Error("webhub.broadcast: cannot send, closing websocket for user", mlog.String("user_id", webConn.UserId))
 							close(webConn.send)
-							connIndex.Remove(webConn)
+							h.connectionIndex.Remove(webConn)
 						}
 					}
 				}
 				if msg.GetBroadcast().UserId != "" {
-					candidates := connIndex.ForUser(msg.GetBroadcast().UserId)
+					candidates := h.connectionIndex.ForUser(msg.GetBroadcast().UserId)
 					for _, webConn := range candidates {
 						broadcast(webConn)
 					}
 					continue
 				}
-				candidates := connIndex.All()
+				candidates := h.connectionIndex.All()
 				for webConn := range candidates {
 					broadcast(webConn)
 				}
 			case <-h.stop:
-				for webConn := range connIndex.All() {
+				for webConn := range h.connectionIndex.All() {
 					webConn.Close()
 					appInstance.SetStatusOffline(webConn.UserId, false)
 				}
@@ -586,6 +587,32 @@ func (h *Hub) Start() {
 	go doRecoverableStart()
 }
 
+func (h *Hub) subscribe(id model.WebsocketSubjectID, wc *WebConn) {
+	var subjectObservers map[*WebConn]bool
+	subjectObservers, has := h.connectionIndex.bySubscription[id]
+	if !has {
+		subjectObservers = map[*WebConn]bool{}
+	}
+	subjectObservers[wc] = true
+	h.connectionIndex.bySubscription[id] = subjectObservers
+}
+
+func (h *Hub) unsubscribe(id model.WebsocketSubjectID, wc *WebConn) {
+	subjectObservers, has := h.connectionIndex.bySubscription[id]
+	if has {
+		delete(subjectObservers, wc)
+		h.connectionIndex.bySubscription[id] = subjectObservers
+	}
+}
+
+func (h *Hub) isSubscribed(id model.WebsocketSubjectID, wc *WebConn) bool {
+	if subjectObservers, ok := h.connectionIndex.bySubscription[id]; ok {
+		isSubscribed := subjectObservers[wc]
+		return isSubscribed
+	}
+	return false
+}
+
 // hubConnectionIndex provides fast addition, removal, and iteration of web connections.
 // It requires 3 functionalities which need to be very fast:
 // - check if a connection exists or not.
@@ -599,6 +626,8 @@ type hubConnectionIndex struct {
 	byConnection map[*WebConn]int
 	// staleThreshold is the limit beyond which inactive connections
 	// will be deleted.
+	// bySubscription stores the list of connections for the given subject
+	bySubscription map[model.WebsocketSubjectID]map[*WebConn]bool
 	staleThreshold time.Duration
 }
 
@@ -607,12 +636,19 @@ func newHubConnectionIndex(interval time.Duration) *hubConnectionIndex {
 		byUserId:       make(map[string][]*WebConn),
 		byConnection:   make(map[*WebConn]int),
 		staleThreshold: interval,
+		bySubscription: make(map[model.WebsocketSubjectID]map[*WebConn]bool),
 	}
 }
 
 func (i *hubConnectionIndex) Add(wc *WebConn) {
 	i.byUserId[wc.UserId] = append(i.byUserId[wc.UserId], wc)
 	i.byConnection[wc] = len(i.byUserId[wc.UserId]) - 1
+}
+
+func (i *hubConnectionIndex) removeSubscriptions(wc *WebConn) {
+	for _, connMap := range i.bySubscription {
+		delete(connMap, wc)
+	}
 }
 
 func (i *hubConnectionIndex) Remove(wc *WebConn) {
@@ -633,6 +669,8 @@ func (i *hubConnectionIndex) Remove(wc *WebConn) {
 	i.byConnection[last] = userConnIndex
 
 	delete(i.byConnection, wc)
+
+	i.removeSubscriptions(wc)
 }
 
 func (i *hubConnectionIndex) Has(wc *WebConn) bool {

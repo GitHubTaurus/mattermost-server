@@ -380,6 +380,21 @@ func (wc *WebConn) readPump() {
 	}
 }
 
+func (wc *WebConn) Subscribe(id model.WebsocketSubjectID) {
+	hub := wc.App.GetHubForUserId(wc.UserId)
+	hub.subscribe(id, wc)
+}
+
+func (wc *WebConn) Unsubscribe(id model.WebsocketSubjectID) {
+	hub := wc.App.GetHubForUserId(wc.UserId)
+	hub.unsubscribe(id, wc)
+}
+
+func (wc *WebConn) IsSubscribed(id model.WebsocketSubjectID) bool {
+	hub := wc.App.GetHubForUserId(wc.UserId)
+	return hub.isSubscribed(id, wc)
+}
+
 func (wc *WebConn) writePump() {
 	ticker := time.NewTicker(pingInterval)
 	authTicker := time.NewTicker(authCheckInterval)
@@ -710,77 +725,21 @@ func (wc *WebConn) shouldSendEventToGuest(msg *model.WebSocketEvent) bool {
 
 // shouldSendEvent returns whether the message should be sent or not.
 func (wc *WebConn) shouldSendEvent(msg *model.WebSocketEvent) bool {
-	// IMPORTANT: Do not send event if WebConn does not have a session
-	if !wc.IsAuthenticated() {
-		return false
-	}
-
-	// If the event contains sanitized data, only send to users that don't have permission to
-	// see sensitive data. Prevents admin clients from receiving events with bad data
-	var hasReadPrivateDataPermission *bool
-	if msg.GetBroadcast().ContainsSanitizedData {
-		hasReadPrivateDataPermission = model.NewBool(wc.App.RolesGrantPermission(wc.GetSession().GetUserRoles(), model.PermissionManageSystem.Id))
-
-		if *hasReadPrivateDataPermission {
+	for _, canSend := range []websocketSendCondition{
+		wsConditionAuth, // IMPORTANT: Do not send event if WebConn does not have a session
+		wsConditionSubject,
+		wsConditionSanitizedData,
+		wsConditionSensitiveData,
+		wsConditionTargetUser,
+		wsConditionOmittedUsers,
+		wsConditionChannel,
+		wsConditionTeam,
+		wsConditionGuest,
+	} {
+		if !canSend(wc, msg) {
 			return false
 		}
 	}
-
-	// If the event contains sensitive data, only send to users with permission to see it
-	if msg.GetBroadcast().ContainsSensitiveData {
-		if hasReadPrivateDataPermission == nil {
-			hasReadPrivateDataPermission = model.NewBool(wc.App.RolesGrantPermission(wc.GetSession().GetUserRoles(), model.PermissionManageSystem.Id))
-		}
-
-		if !*hasReadPrivateDataPermission {
-			return false
-		}
-	}
-
-	// If the event is destined to a specific user
-	if msg.GetBroadcast().UserId != "" {
-		return wc.UserId == msg.GetBroadcast().UserId
-	}
-
-	// if the user is omitted don't send the message
-	if len(msg.GetBroadcast().OmitUsers) > 0 {
-		if _, ok := msg.GetBroadcast().OmitUsers[wc.UserId]; ok {
-			return false
-		}
-	}
-
-	// Only report events to users who are in the channel for the event
-	if msg.GetBroadcast().ChannelId != "" {
-		if model.GetMillis()-wc.lastAllChannelMembersTime > webConnMemberCacheTime {
-			wc.allChannelMembers = nil
-			wc.lastAllChannelMembersTime = 0
-		}
-
-		if wc.allChannelMembers == nil {
-			result, err := wc.App.Srv().Store.Channel().GetAllChannelMembersForUser(wc.UserId, false, false)
-			if err != nil {
-				mlog.Error("webhub.shouldSendEvent.", mlog.Err(err))
-				return false
-			}
-			wc.allChannelMembers = result
-			wc.lastAllChannelMembersTime = model.GetMillis()
-		}
-
-		if _, ok := wc.allChannelMembers[msg.GetBroadcast().ChannelId]; ok {
-			return true
-		}
-		return false
-	}
-
-	// Only report events to users who are in the team for the event
-	if msg.GetBroadcast().TeamId != "" {
-		return wc.isMemberOfTeam(msg.GetBroadcast().TeamId)
-	}
-
-	if wc.GetSession().Props[model.SessionPropIsGuest] == "true" {
-		return wc.shouldSendEventToGuest(msg)
-	}
-
 	return true
 }
 

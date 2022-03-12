@@ -75,6 +75,10 @@ const (
 	WebsocketEventThreadFollowChanged                 = "thread_follow_changed"
 	WebsocketEventThreadReadChanged                   = "thread_read_changed"
 	WebsocketFirstAdminVisitMarketplaceStatusReceived = "first_admin_visit_marketplace_status_received"
+	WebsocketEventSubscribe                           = "subscribe"
+	WebsocketEventUnsubscribe                         = "unsubscribe"
+
+	WebsocketSubjectInsights WebsocketSubjectID = "insights"
 )
 
 type WebSocketMessage interface {
@@ -93,6 +97,7 @@ type WebsocketBroadcast struct {
 	// ReliableClusterSend indicates whether or not the message should
 	// be sent through the cluster using the reliable, TCP backed channel.
 	ReliableClusterSend bool `json:"-"`
+	SubjectID           WebsocketSubjectID
 }
 
 func (wb *WebsocketBroadcast) copy() *WebsocketBroadcast {
@@ -155,6 +160,17 @@ type webSocketEventJSON struct {
 	Sequence  int64                  `json:"seq"`
 }
 
+// WebsocketSubjectID represents the identifier that associates subjects (websockets messages) with observers (websocket connections).
+// An example of which is "insights", however, this could support more complex strings like "channels/wds7jxtetjgjue9yca5i5r1cjc".
+type WebsocketSubjectID string
+
+func (si WebsocketSubjectID) IsValid() bool {
+	_, has := map[WebsocketSubjectID]bool{
+		WebsocketSubjectInsights: true,
+	}[si]
+	return has
+}
+
 type WebSocketEvent struct {
 	event           string
 	data            map[string]interface{}
@@ -180,6 +196,10 @@ func (ev *WebSocketEvent) PrecomputeJSON() *WebSocketEvent {
 
 func (ev *WebSocketEvent) Add(key string, value interface{}) {
 	ev.data[key] = value
+}
+
+func (ev *WebSocketEvent) SetSubject(id WebsocketSubjectID) {
+	ev.broadcast.SubjectID = id
 }
 
 func NewWebSocketEvent(event, teamId, channelId, userId string, omitUsers map[string]bool) *WebSocketEvent {
